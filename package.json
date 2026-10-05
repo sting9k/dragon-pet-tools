@@ -1,0 +1,14 @@
+{
+  "name": "dragon-pet-tools",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Renders Spine models of the asset pack for the pet redraw tools",
+  "type": "module",
+  "scripts": {
+    "render": "node spine/render.mjs"
+  },
+  "dependencies": {
+    "@esotericsoftware/spine-webgl": "4.1.56",
+    "puppeteer-core": "^25.12.0"
+  }
+}

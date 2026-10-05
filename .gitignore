@@ -1,0 +1,24 @@
+# secrets and machine settings
+.env
+.env.*
+!.env.example
+
+# dependencies and caches
+node_modules/
+__pycache__/
+*.pyc
+.DS_Store
+
+# editor
+.idea/
+.vscode/
+
+# per-pet content, made anew by the agent for every pet: never stored here
+pets/*
+!pets/README.md
+demo_*.py
+!demo_darknix.py
+
+# anything made from pack art belongs under <assets>/generated, never here
+*.skel
+*.atlas

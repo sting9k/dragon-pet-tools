@@ -1,0 +1,207 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>spine render</title>
+<script src="/spine-webgl.js"></script>
+<script>
+// Renders Spine 4.1 skeletons to pictures. Driven by render.mjs through puppeteer.
+const SS = 3; // supersample factor, downscaled when a frame is copied out
+let canvas, ctx, gl, renderer;
+
+function init() {
+  canvas = document.createElement('canvas');
+  canvas.width = canvas.height = 16;
+  ctx = new spine.ManagedWebGLRenderingContext(canvas, { alpha: true, premultipliedAlpha: true, preserveDrawingBuffer: true, antialias: true });
+  gl = ctx.gl;
+  renderer = new spine.SceneRenderer(canvas, ctx);
+  return gl.getParameter(gl.VERSION);
+}
+
+async function loadModel(cfg) {
+  const skel = cfg.skel ?? cfg.base + '.skel', atl = cfg.atlas ?? cfg.base + '.atlas';
+  const am = new spine.AssetManager(ctx, '/spine/');
+  am.loadBinary(skel);
+  am.loadTextureAtlas(atl);
+  await new Promise((res, rej) => {
+    const tick = () => {
+      if (!am.isLoadingComplete()) return setTimeout(tick, 5);
+      am.hasErrors() ? rej(new Error('load failed: ' + JSON.stringify(am.getErrors()))) : res();
+    };
+    tick();
+  });
+  const ta = am.require(atl);
+  const data = new spine.SkeletonBinary(new spine.AtlasAttachmentLoader(ta)).readSkeletonData(am.require(skel));
+  const skeleton = new spine.Skeleton(data);
+  if (cfg.skins) {
+    const skin = new spine.Skin('combined');
+    for (const n of cfg.skins) { const s = data.findSkin(n); if (s) skin.addSkin(s); }
+    skeleton.setSkin(skin);
+  }
+  return { am, data, skeleton, pma: ta.pages.some(p => p.pma) };
+}
+
+function pose(m, anim, t) {
+  const sk = m.skeleton;
+  sk.setToSetupPose();
+  if (anim) anim.apply(sk, 0, t, false, null, 1, spine.MixBlend.setup, spine.MixDirection.mixIn);
+  sk.updateWorldTransform();
+}
+
+function bounds(m) {
+  const o = new spine.Vector2(), s = new spine.Vector2();
+  m.skeleton.getBounds(o, s, []);
+  return Number.isFinite(o.x) && s.x > 0 && s.y > 0 ? { x0: o.x, y0: o.y, x1: o.x + s.x, y1: o.y + s.y } : null;
+}
+
+const union = (a, b) => !a ? b : !b ? a : { x0: Math.min(a.x0, b.x0), y0: Math.min(a.y0, b.y0), x1: Math.max(a.x1, b.x1), y1: Math.max(a.y1, b.y1) };
+
+function draw(m, box, scale, cw, ch) {
+  canvas.width = cw * SS; canvas.height = ch * SS;
+  const cam = renderer.camera;
+  cam.setViewport(canvas.width, canvas.height);
+  cam.position.x = (box.x0 + box.x1) / 2;
+  cam.position.y = (box.y0 + box.y1) / 2;
+  cam.zoom = 1 / (scale * SS);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(0, 0, 0, 0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  renderer.begin();
+  renderer.drawSkeleton(m.skeleton, m.pma);
+  renderer.end();
+}
+
+// The model posed exactly as `sheet` draws it in a cell, described part by part: for every drawn slot its
+// triangles, with each corner's place in the cell (pixels) and in the atlas page (0..1). rig_skin.py
+// uses this to cut a redrawn picture of the model back into the model's own parts.
+async function rig(cfg, cell) {
+  const m = await loadModel(cfg);
+  const names = m.data.animations.map(a => a.name);
+  const pick = ['idle', 'move', 'idle_1', 'idle_01'].find(n => names.includes(n)) ?? names[0];
+  const anim = pick ? m.data.findAnimation(pick) : null;
+  pose(m, anim, anim ? anim.duration * 0.3 : 0);
+  const b = bounds(m), scale = (cell - 12) / Math.max(b.x1 - b.x0, b.y1 - b.y0);
+  const cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2, slots = [];
+  for (const slot of m.skeleton.drawOrder) {
+    const a = slot.getAttachment();
+    let world, tris;
+    if (a instanceof spine.RegionAttachment) {
+      world = new Array(8);
+      a.computeWorldVertices(slot, world, 0, 2);
+      tris = [0, 1, 2, 2, 3, 0];
+    } else if (a instanceof spine.MeshAttachment) {
+      world = new Array(a.worldVerticesLength);
+      a.computeWorldVertices(slot, 0, a.worldVerticesLength, world, 0, 2);
+      tris = Array.from(a.triangles);
+    } else continue;
+    slots.push({
+      slot: slot.data.name, attachment: a.name, mesh: a instanceof spine.MeshAttachment, alpha: slot.color.a * a.color.a,
+      at: world.map((v, i) => (i % 2 ? cell / 2 - (v - cy) * scale : cell / 2 + (v - cx) * scale)), uvs: Array.from(a.uvs), tris,
+    });
+  }
+  m.am.dispose();
+  return { cell, anims: names, slots };
+}
+
+// n evenly spaced frames of one animation, side by side, all drawn in the same box
+// `fit` (animation names) makes the box cover those animations instead, so strips of several animations share one scale
+async function strip(cfg, animName, n, cell, fit) {
+  const m = await loadModel(cfg), anim = m.data.findAnimation(animName);
+  let box = null;
+  for (const a of fit?.length ? fit.map(f => m.data.findAnimation(f)) : [anim])
+    for (let k = 0; k < 12; k++) { pose(m, a, a.duration * k / 12); box = union(box, bounds(m)); }
+  if (!fit?.length) { box = null; for (let k = 0; k < n; k++) { pose(m, anim, anim.duration * k / n); box = union(box, bounds(m)); } }
+  const scale = (cell - 12) / Math.max(box.x1 - box.x0, box.y1 - box.y0);
+  const c = document.createElement('canvas');
+  c.width = n * cell; c.height = cell;
+  const g = c.getContext('2d');
+  for (let k = 0; k < n; k++) {
+    pose(m, anim, anim.duration * k / n);
+    draw(m, box, scale, cell, cell);
+    g.drawImage(canvas, 0, 0, canvas.width, canvas.height, k * cell, 0, cell, cell);
+  }
+  m.am.dispose();
+  return c.toDataURL('image/png');
+}
+
+// the skeleton's bones in one pose of an animation (at = 0..1 of its length): where each starts, its world angle and length
+async function bones(cfg, animName, at) {
+  const m = await loadModel(cfg), anim = m.data.findAnimation(animName);
+  pose(m, anim, anim ? anim.duration * at : 0);
+  const out = m.skeleton.bones.map(b => ({ name: b.data.name, parent: b.parent?.data.name ?? null, x: +b.worldX.toFixed(1), y: +b.worldY.toFixed(1), angle: +b.getWorldRotationX().toFixed(1), length: b.data.length }));
+  const slots = m.skeleton.drawOrder.map(s => ({ slot: s.data.name, bone: s.bone.data.name, attachment: s.getAttachment()?.name ?? null }));
+  m.am.dispose();
+  return { anims: m.data.animations.map(a => a.name), bones: out, slots };
+}
+
+// one pose of an animation drawn n times with a chain of bones turned from deg0 to deg1 in total (added to their animated
+// angles), side by side. boneName is "head" or a chain with each bone's share of the turn, "head:0.6,body3:0.4".
+// `tip` is a point in the first bone's own space (e.g. the snout) and comes back as its place in each cell, in pixels
+async function aim(cfg, animName, at, boneName, deg0, deg1, n, cell, tip) {
+  const m = await loadModel(cfg), anim = m.data.findAnimation(animName);
+  const chain = boneName.split(',').map(p => { const [name, share = '1'] = p.split(':'), b = m.skeleton.findBone(name); if (!b) throw new Error(`no bone "${name}"`); return { b, share: +share }; });
+  const bone = chain[0].b;
+  const turn = k => {
+    pose(m, anim, anim.duration * at);
+    const deg = n === 1 ? deg0 : deg0 + (deg1 - deg0) * k / (n - 1);
+    for (const c of chain) c.b.rotation += deg * c.share;
+    m.skeleton.updateWorldTransform();
+  };
+  let box = null;
+  for (let k = 0; k < n; k++) { turn(k); box = union(box, bounds(m)); }
+  const scale = (cell - 12) / Math.max(box.x1 - box.x0, box.y1 - box.y0);
+  const cx = (box.x0 + box.x1) / 2, cy = (box.y0 + box.y1) / 2;
+  const c = document.createElement('canvas');
+  c.width = n * cell; c.height = cell;
+  const g = c.getContext('2d'), tips = [];
+  for (let k = 0; k < n; k++) {
+    turn(k);
+    draw(m, box, scale, cell, cell);
+    g.drawImage(canvas, 0, 0, canvas.width, canvas.height, k * cell, 0, cell, cell);
+    const w = bone.localToWorld(new spine.Vector2(tip[0], tip[1]));
+    tips.push([+(cell / 2 + (w.x - cx) * scale).toFixed(1), +(cell / 2 - (w.y - cy) * scale).toFixed(1)]);
+  }
+  m.am.dispose();
+  return { png: c.toDataURL('image/png'), tips, scale, origin: [+(cell / 2 - cx * scale).toFixed(1), +(cell / 2 + cy * scale).toFixed(1)] };
+}
+
+// Contact sheet of many models, each in one pose with its name and animation list underneath.
+// `bare` leaves out the ground colour and the captions, so the models stand on transparency.
+async function sheet(models, cell, cols, bare) {
+  const lh = bare ? 0 : 34, rows = Math.ceil(models.length / cols);
+  const c = document.createElement('canvas');
+  c.width = cols * cell; c.height = rows * (cell + lh);
+  const g = c.getContext('2d');
+  if (!bare) { g.fillStyle = '#20222c'; g.fillRect(0, 0, c.width, c.height); }
+  g.imageSmoothingQuality = 'high';
+  const info = [];
+  for (let i = 0; i < models.length; i++) {
+    const x = (i % cols) * cell, y = Math.floor(i / cols) * (cell + lh), cfg = models[i];
+    g.fillStyle = '#9fb'; g.font = '11px sans-serif';
+    try {
+      const m = await loadModel(cfg);
+      const names = m.data.animations.map(a => a.name);
+      const pick = cfg.anim ?? ['idle', 'move', 'idle_1', 'idle_01'].find(n => names.includes(n)) ?? names[0];
+      const anim = pick ? m.data.findAnimation(pick) : null;
+      pose(m, anim, anim ? anim.duration * (cfg.at ?? 0.3) : 0);
+      const b = bounds(m);
+      if (b) {
+        const scale = (cell - 12) / Math.max(b.x1 - b.x0, b.y1 - b.y0);
+        draw(m, b, scale, cell, cell);
+        g.drawImage(canvas, 0, 0, canvas.width, canvas.height, x, y, cell, cell);
+      }
+      if (!bare) {
+        g.fillText(cfg.id.slice(0, 30), x + 3, y + cell + 11);
+        g.fillStyle = '#89a'; g.font = '9px sans-serif';
+        const an = names.join(' ');
+        g.fillText(an.slice(0, 40), x + 3, y + cell + 21);
+        g.fillText(an.slice(40, 80), x + 3, y + cell + 30);
+      }
+      info.push({ id: cfg.id, anims: m.data.animations.map(a => [a.name, +a.duration.toFixed(2)]), skins: m.data.skins.map(s => s.name), bounds: b && [Math.round(b.x1 - b.x0), Math.round(b.y1 - b.y0)] });
+      m.am.dispose();
+    } catch (e) {
+      if (!bare) { g.fillStyle = '#f66'; g.fillText((cfg.id + ' ERR ' + e.message).slice(0, 34), x + 3, y + cell / 2); }
+      info.push({ id: cfg.id, error: e.message });
+    }
+  }
+  return { png: c.toDataURL('image/png'), info };
+}
+</script>
